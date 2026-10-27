@@ -1,0 +1,878 @@
+-- Auto missão drip menu | by: angel
+-- Delta (Android)
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local GuiService = game:GetService("GuiService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
+
+local env = (getgenv and getgenv()) or _G
+if type(env.amd_destroy) == "function" then pcall(env.amd_destroy) end
+
+local conns = {}
+local uiAlive = true
+local function bind(c) conns[#conns + 1] = c return c end
+
+local Rayfield
+do
+  local ok, lib = pcall(function()
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/x2Swiftz/UI-Library/main/Libraries/Rayfield%20-%20Library.lua"))()
+  end)
+  if not ok or not lib then
+    warn("[Auto missão] não consegui carregar a UI")
+    return
+  end
+  Rayfield = lib
+end
+
+-- util
+local ACC = {["á"]="a",["à"]="a",["â"]="a",["ã"]="a",["ä"]="a",["é"]="e",["ê"]="e",["è"]="e",["í"]="i",["ì"]="i",
+  ["ó"]="o",["ô"]="o",["õ"]="o",["ò"]="o",["ú"]="u",["ù"]="u",["ü"]="u",["ç"]="c",
+  ["Á"]="a",["À"]="a",["Â"]="a",["Ã"]="a",["É"]="e",["Ê"]="e",["Í"]="i",["Ó"]="o",["Ô"]="o",["Õ"]="o",["Ú"]="u",["Ç"]="c"}
+local function norm(s)
+  s = tostring(s or ""):gsub("<[^>]+>", "")
+  for k, v in pairs(ACC) do s = s:gsub(k, v) end
+  s = s:lower():gsub("[_%-]", " "):gsub("%s+", " ")
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function ownUi(d)
+  local sg = d:FindFirstAncestorWhichIsA("ScreenGui")
+  return sg ~= nil and sg.Name:find("Rayfield", 1, true) ~= nil
+end
+
+-- config
+local CFG = {
+  intervalo = 0.2,
+  tpDist = 4, flyAlt = 100, deitado = true, noclip = true,
+  fireRate = 0.1, silent = true, rewrite = true,
+  remoteKeys = "fire,shoot,hit,damage,bullet,attack,gun,weapon,shot",
+  arma = "fal",
+  watchdog = 45,
+}
+
+local ORDER = {"rei", "delta", "mutante", "rapido", "comum"}
+local LABEL = {rei = "Delta Rei", delta = "Deltas", mutante = "Mutantes", rapido = "Rápidos", comum = "Zumbis"}
+local KEYS = {
+  rei = {"delta rei", "deltarei", "king"},
+  delta = {"delta"},
+  mutante = {"mutante", "mutant"},
+  rapido = {"rapido", "fast", "runner"},
+  comum = {"zumbi", "zombie", "zombi"},
+}
+local NOME1 = {rei = "Delta Rei", delta = "Delta", mutante = "Mutante", rapido = "Rápido", comum = "Zumbi"}
+local function classify(text)
+  text = norm(text)
+  for _, cat in ipairs(ORDER) do
+    for _, k in ipairs(KEYS[cat]) do
+      if k ~= "" and text:find(k, 1, true) then return cat end
+    end
+  end
+end
+
+-- estado
+local S = {state = "AGUARDANDO", run = 0, paused = false, note = "", target = nil, dist = nil,
+  weapon = nil, ammo = nil, kills = {}, aimPart = nil, fireNote = ""}
+local setStateHook
+local function setState(s)
+  S.state = s
+  if setStateHook then setStateHook() end
+end
+
+local function getChar()
+  local c = LP.Character
+  local h = c and c:FindFirstChildOfClass("Humanoid")
+  local r = c and c:FindFirstChild("HumanoidRootPart")
+  if h and r and h.Health > 0 then return c, r, h end
+end
+
+-- missão (lê o hud do jogo)
+local HUD = {labels = {}, prog = {}, mission = nil, ammoLbl = nil, ammoTry = 0}
+
+local function scanMission(full)
+  local pg = LP:FindFirstChildOfClass("PlayerGui")
+  if not pg then return end
+  if full or #HUD.labels == 0 then
+    HUD.labels = {}
+    for _, d in ipairs(pg:GetDescendants()) do
+      if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" then
+        local t = d.Text
+        if (t:find("/", 1, true) or norm(t):find("missao:", 1, true)) and not ownUi(d) then
+          HUD.labels[#HUD.labels + 1] = d
+        end
+      end
+    end
+  end
+  local newProg, mission = {}, nil
+  for i = #HUD.labels, 1, -1 do
+    local d = HUD.labels[i]
+    if not d.Parent then
+      table.remove(HUD.labels, i)
+    else
+      for line in d.Text:gmatch("[^\r\n]+") do
+        local n = norm(line)
+        local m = n:match("^missao:%s*(.+)")
+        if m then mission = m:upper() end
+        local name, c, mx = n:match("^(.-):%s*(%d+)%s*/%s*(%d+)")
+        if name then
+          local cat = classify(name)
+          if cat then newProg[cat] = {cur = tonumber(c), max = tonumber(mx)} end
+        end
+      end
+    end
+  end
+  if next(newProg) ~= nil or full then HUD.prog = newProg end
+  if mission then HUD.mission = mission end
+end
+
+local function pendingList()
+  local p, known = {}, false
+  for _, c in ipairs(ORDER) do
+    local g = HUD.prog[c]
+    if g then
+      known = true
+      if g.cur < g.max then p[#p + 1] = c end
+    end
+  end
+  if not known then return ORDER, false end
+  return p, true
+end
+
+-- zumbis
+local Z, BL = {}, {}
+
+local function considerHum(h)
+  local m = h.Parent
+  if not m or not m:IsA("Model") or Z[m] or m == LP.Character then return end
+  if Players:GetPlayerFromCharacter(m) then return end
+  local txt = m.Name .. " " .. h.DisplayName .. " " .. (m.Parent and m.Parent.Name or "")
+  local cat = classify(txt)
+  if not cat then return end
+  local info = {model = m, hum = h, cat = cat}
+  info.conn = h.Died:Connect(function() info.dead = true end)
+  Z[m] = info
+end
+
+local function refreshZombies()
+  for m, info in pairs(Z) do
+    if not m.Parent or not info.hum.Parent then
+      pcall(function() info.conn:Disconnect() end)
+      Z[m] = nil
+    end
+  end
+  for _, d in ipairs(workspace:GetDescendants()) do
+    if d:IsA("Humanoid") then considerHum(d) end
+  end
+end
+
+bind(workspace.DescendantAdded:Connect(function(d)
+  if d:IsA("Humanoid") then task.defer(considerHum, d) end
+end))
+
+local function partOf(m)
+  return m:FindFirstChild("Head") or m:FindFirstChild("UpperTorso") or m:FindFirstChild("HumanoidRootPart")
+    or m:FindFirstChild("Torso") or m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+end
+
+local function isAlive(info)
+  return not info.dead and info.model.Parent and info.hum.Parent and info.hum.Health > 0
+end
+
+local function pickTarget()
+  local _, root = getChar()
+  if not root then return nil end
+  local pend = pendingList()
+  local prio = {}
+  for i, c in ipairs(pend) do prio[c] = i end
+  local best, bs
+  for m, info in pairs(Z) do
+    if not isAlive(info) then
+      if not m.Parent then Z[m] = nil end
+    else
+      local p = prio[info.cat]
+      local part = partOf(m)
+      if p and part and (BL[m] or 0) < os.clock() then
+        local d = (part.Position - root.Position).Magnitude
+        local s = p * 1000000 + d
+        if not bs or s < bs then best, bs = info, s end
+      end
+    end
+  end
+  return best
+end
+
+local function aliveCount(cat)
+  local n = 0
+  for _, info in pairs(Z) do
+    if info.cat == cat and isAlive(info) then n = n + 1 end
+  end
+  return n
+end
+
+-- arma
+local function findTool()
+  local list = {}
+  for _, c in ipairs({LP.Character, LP:FindFirstChildOfClass("Backpack")}) do
+    if c then
+      for _, t in ipairs(c:GetChildren()) do
+        if t:IsA("Tool") then list[#list + 1] = t end
+      end
+    end
+  end
+  local key, best = norm(CFG.arma), nil
+  for _, t in ipairs(list) do
+    local n = norm(t.Name)
+    if n == key then return t, list end
+    if not best and key ~= "" and n:find(key, 1, true) then best = t end
+  end
+  return best, list
+end
+
+local function ammoHud(tool)
+  if HUD.ammoLbl and HUD.ammoLbl.Parent then
+    local c = HUD.ammoLbl.Text:match("^%s*(%d+)%s*/%s*%d+%s*$")
+    if c then return tonumber(c) end
+  end
+  HUD.ammoLbl = nil
+  if os.clock() - HUD.ammoTry < 10 then return nil end
+  HUD.ammoTry = os.clock()
+  local pg = LP:FindFirstChildOfClass("PlayerGui")
+  if not pg then return nil end
+  local tn = norm(tool.Name)
+  for _, d in ipairs(pg:GetDescendants()) do
+    if d:IsA("TextLabel") and norm(d.Text) == tn and not ownUi(d) then
+      local anc = d.Parent
+      for _ = 1, 3 do
+        if anc then
+          for _, e in ipairs(anc:GetDescendants()) do
+            if e:IsA("TextLabel") and e.Text:match("^%s*%d+%s*/%s*%d+%s*$") then
+              HUD.ammoLbl = e
+              return tonumber(e.Text:match("%d+"))
+            end
+          end
+          anc = anc.Parent
+        end
+      end
+    end
+  end
+end
+
+local function isAmmoName(n)
+  n = norm(n)
+  if n:find("max", 1, true) or n:find("reserve", 1, true) or n:find("total", 1, true) then return false end
+  return n:find("ammo", 1, true) or n:find("municao", 1, true) or n:find("clip", 1, true)
+    or n:find("mag", 1, true) or n:find("bullet", 1, true)
+end
+
+local function getAmmo(tool)
+  for k, v in pairs(tool:GetAttributes()) do
+    if type(v) == "number" and isAmmoName(k) then return v end
+  end
+  for _, d in ipairs(tool:GetDescendants()) do
+    if (d:IsA("IntValue") or d:IsA("NumberValue")) and isAmmoName(d.Name) then return d.Value end
+  end
+  return ammoHud(tool)
+end
+
+-- silent aim + remotes
+local SA = {dead = false}
+local function saTarget()
+  local p = S.aimPart
+  if CFG.silent and not SA.dead and p and p.Parent and S.run > 0 and S.state == "EXECUTANDO" then return p end
+end
+
+local function isMine(i)
+  local bp = LP:FindFirstChildOfClass("Backpack")
+  return (LP.Character and i:IsDescendantOf(LP.Character)) or (bp and i:IsDescendantOf(bp)) or false
+end
+
+local function remoteMatch(r)
+  if isMine(r) then return true end
+  local path = norm(r:GetFullName())
+  for k in norm(CFG.remoteKeys):gmatch("[^,%s]+") do
+    if path:find(k, 1, true) then return true end
+  end
+  return false
+end
+
+local function rewriteArgs(args, p)
+  local cam = workspace.CurrentCamera
+  local org = cam and cam.CFrame.Position or Vector3.new()
+  local _, myRoot = getChar()
+  local me = myRoot and myRoot.Position or org
+  local model = S.target and S.target.model
+  local hum = model and model:FindFirstChildOfClass("Humanoid")
+  local changed = false
+  local function near(pos) return (pos - me).Magnitude < 12 or (pos - org).Magnitude < 12 end
+  local function rw(v, depth)
+    local t = typeof(v)
+    if t == "Instance" then
+      if isMine(v) then return v end
+      if v:IsA("Humanoid") then
+        if hum and v ~= hum then changed = true return hum end
+        return v
+      end
+      if v:IsA("BasePart") then
+        if model and v:IsDescendantOf(model) then return v end
+        changed = true return p
+      end
+      if v:IsA("Model") and model and v ~= model and v:FindFirstChildOfClass("Humanoid") then
+        changed = true return model
+      end
+      return v
+    elseif t == "Vector3" then
+      local mg = v.Magnitude
+      if mg < 0.5 then return v end
+      if mg <= 1.5 then changed = true return (p.Position - org).Unit end
+      if near(v) then return v end
+      changed = true return p.Position
+    elseif t == "CFrame" then
+      if near(v.Position) then return v end
+      changed = true return CFrame.new(p.Position)
+    elseif t == "table" and depth < 2 then
+      local c = {}
+      for k, x in pairs(v) do c[k] = rw(x, depth + 1) end
+      return c
+    end
+    return v
+  end
+  local out = {}
+  for i = 1, args.n do out[i] = rw(args[i], 0) end
+  return changed, out
+end
+
+if hookmetamethod and getnamecallmethod and checkcaller then
+  local old
+  local function pass(self, m, ...)
+    if setnamecallmethod then setnamecallmethod(m) end
+    return old(self, ...)
+  end
+  local hook = function(self, ...)
+    if checkcaller() then return old(self, ...) end
+    local m = getnamecallmethod()
+    if SA.dead then return pass(self, m, ...) end
+    if self == workspace then
+      local p = saTarget()
+      if p then
+        if m == "Raycast" then
+          local o, d, prm = ...
+          if typeof(o) == "Vector3" and typeof(d) == "Vector3" and d.Magnitude >= 50 then
+            local nd = p.Position - o
+            return pass(self, m, o, nd.Unit * math.max(d.Magnitude, nd.Magnitude + 5), prm)
+          end
+        elseif m == "FindPartOnRay" or m == "FindPartOnRayWithIgnoreList" or m == "FindPartOnRayWithWhitelist" then
+          local ray, a1, b1, c1 = ...
+          if typeof(ray) == "Ray" and ray.Direction.Magnitude >= 50 then
+            local nd = p.Position - ray.Origin
+            return pass(self, m, Ray.new(ray.Origin, nd.Unit * math.max(ray.Direction.Magnitude, nd.Magnitude + 5)), a1, b1, c1)
+          end
+        end
+      end
+    elseif m == "FireServer" or m == "InvokeServer" then
+      local p = saTarget()
+      if p and CFG.rewrite and S.target and remoteMatch(self) then
+        local args = table.pack(...)
+        local ok, changed, out = pcall(rewriteArgs, args, p)
+        if ok and changed then return pass(self, m, table.unpack(out, 1, args.n)) end
+      end
+    end
+    return pass(self, m, ...)
+  end
+  old = hookmetamethod(game, "__namecall", newcclosure and newcclosure(hook) or hook)
+
+  local mouse = LP:GetMouse()
+  local oldIdx
+  oldIdx = hookmetamethod(game, "__index", function(self, k)
+    if (k == "Hit" or k == "Target") and self == mouse and not checkcaller() then
+      local p = saTarget()
+      if p then return k == "Hit" and CFrame.new(p.Position) or p end
+    end
+    return oldIdx(self, k)
+  end)
+end
+
+-- voo / teleporte / noclip
+local hoverCF
+bind(RunService.Heartbeat:Connect(function()
+  if not hoverCF or S.run == 0 or S.state ~= "EXECUTANDO" then return end
+  local _, root = getChar()
+  if root then
+    if (root.Position - hoverCF.Position).Magnitude > 0.5 then root.CFrame = hoverCF end
+    root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+  end
+end))
+
+local rp = RaycastParams.new()
+rp.FilterType = Enum.RaycastFilterType.Exclude
+local function releaseRoot()
+  local had = hoverCF
+  hoverCF = nil
+  if had then
+    local _, root, hum = getChar()
+    if hum then hum.PlatformStand = false end
+    if root then
+      rp.FilterDescendantsInstances = {LP.Character}
+      local r = workspace:Raycast(root.Position, Vector3.new(0, -500, 0), rp)
+      if r then pcall(function() root.CFrame = CFrame.new(r.Position + Vector3.new(0, 3.5, 0)) end) end
+    end
+  end
+end
+
+local function teleportNear(root, model, part)
+  local cam = workspace.CurrentCamera
+  local look = cam and cam.CFrame.LookVector or root.CFrame.LookVector
+  look = Vector3.new(look.X, 0, look.Z)
+  if look.Magnitude < 0.01 then look = Vector3.new(0, 0, -1) end
+  look = look.Unit
+  local mr = model:FindFirstChild("HumanoidRootPart")
+  local baseY = mr and mr.Position.Y or part.Position.Y
+  local b = part.Position
+  local pos = Vector3.new(b.X - look.X * CFG.tpDist, baseY + CFG.flyAlt, b.Z - look.Z * CFG.tpDist)
+  local cf = CFG.deitado and CFrame.lookAt(pos, pos + Vector3.new(0, -1, 0), look) or CFrame.lookAt(pos, pos + look)
+  local ok = pcall(function()
+    root.CFrame = cf
+    root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+  end)
+  if not ok then return false end
+  local _, _, hm = getChar()
+  if hm then hm.PlatformStand = CFG.deitado and true or false end
+  hoverCF = cf
+  return true
+end
+
+local ncParts, ncT = {}, 0
+bind(RunService.Stepped:Connect(function()
+  if not (CFG.noclip and S.run > 0 and S.state == "EXECUTANDO") then return end
+  local c = LP.Character
+  if not c then return end
+  if os.clock() - ncT > 1 then
+    ncParts = {}
+    for _, d in ipairs(c:GetDescendants()) do
+      if d:IsA("BasePart") then ncParts[#ncParts + 1] = d end
+    end
+    ncT = os.clock()
+  end
+  for _, d in ipairs(ncParts) do
+    if d.Parent and d.CanCollide then d.CanCollide = false end
+  end
+end))
+
+-- auto tiro
+local VIM
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+local function isShown(o)
+  local cur = o
+  while cur and cur ~= game do
+    if cur:IsA("GuiObject") and not cur.Visible then return false end
+    if cur:IsA("ScreenGui") and not cur.Enabled then return false end
+    cur = cur.Parent
+  end
+  return o.AbsoluteSize.X > 0 and o.AbsoluteSize.Y > 0
+end
+
+local fireObj, fireTry = nil, 0
+local function findFire()
+  if fireObj and fireObj.Parent and isShown(fireObj) then return fireObj end
+  fireObj = nil
+  if os.clock() - fireTry < 1.5 then return nil end
+  fireTry = os.clock()
+  local pg = LP:FindFirstChildOfClass("PlayerGui")
+  if not pg then return nil end
+  for _, d in ipairs(pg:GetDescendants()) do
+    if d:IsA("GuiObject") then
+      local hit = false
+      if (d:IsA("TextButton") or d:IsA("TextLabel")) and norm(d.Text) == "fire" then hit = true
+      elseif d:IsA("GuiButton") and norm(d.Name) == "fire" then hit = true end
+      if hit and isShown(d) and not ownUi(d) then
+        fireObj = d:IsA("GuiButton") and d or (d:FindFirstAncestorWhichIsA("GuiButton") or d)
+        return fireObj
+      end
+    end
+  end
+  return nil
+end
+
+local hold = {on = false, pos = nil, t0 = 0, ammo0 = nil, altInset = false, lastMove = 0, cool = 0}
+local TOUCH_ID = 9
+local lastFire = 0
+
+local function fireXY(obj)
+  local c = obj.AbsolutePosition + obj.AbsoluteSize / 2
+  local sg = obj:FindFirstAncestorWhichIsA("ScreenGui")
+  local inset = GuiService:GetGuiInset().Y
+  local ins = (sg and sg.IgnoreGuiInset) and 0 or inset
+  if hold.altInset then ins = (ins == 0) and inset or 0 end
+  return c.X, c.Y + ins
+end
+
+local function releaseFire()
+  if not hold.on then return end
+  hold.on = false
+  if hold.pos and VIM then
+    local x, y = hold.pos.X, hold.pos.Y
+    pcall(function() VIM:SendTouchEvent(TOUCH_ID, 2, x, y) end)
+    pcall(function() VIM:SendMouseButtonEvent(x, y, 0, false, game, 0) end)
+  end
+  if hold.sig and firesignal then pcall(firesignal, hold.sig.MouseButton1Up) end
+  hold.sig = nil
+end
+
+local function pressFireHold(obj)
+  local x, y = fireXY(obj)
+  hold.on = true; hold.pos = Vector2.new(x, y); hold.t0 = os.clock()
+  hold.ammo0 = S.ammo; hold.lastMove = os.clock()
+  if VIM then
+    pcall(function() VIM:SendTouchEvent(TOUCH_ID, 0, x, y) end)
+    pcall(function() VIM:SendMouseButtonEvent(x, y, 0, true, game, 0) end)
+  elseif firesignal and obj:IsA("GuiButton") then
+    hold.sig = obj
+    pcall(firesignal, obj.MouseButton1Down)
+  end
+end
+
+bind(RunService.Heartbeat:Connect(function()
+  local c, _, hum = getChar()
+  local tool = c and findTool()
+  S.weapon = tool and tool.Name or nil
+  if os.clock() - (S.ammoT or 0) > 0.15 then
+    S.ammoT = os.clock()
+    S.ammo = tool and getAmmo(tool) or nil
+  end
+  local active = S.run > 0 and S.state == "EXECUTANDO" and S.aimPart and S.aimPart.Parent
+  if not active or not tool then
+    releaseFire()
+    if active and not tool then S.fireNote = "arma não encontrada" end
+    return
+  end
+  if tool.Parent ~= c then
+    releaseFire()
+    if os.clock() - lastFire > 0.3 then
+      lastFire = os.clock()
+      pcall(function() hum:EquipTool(tool) end)
+    end
+    S.fireNote = "equipando"
+    return
+  end
+  if S.ammo and S.ammo <= 0 then
+    releaseFire()
+    S.fireNote = "recarregando"
+    if os.clock() - (S.lastReload or 0) > 2.5 then
+      S.lastReload = os.clock()
+      pcall(function()
+        ReplicatedStorage.WeaponAssets.Events.Reload:FireServer(tool)
+      end)
+    end
+    return
+  end
+  local obj = findFire()
+  if not obj then
+    releaseFire()
+    S.fireNote = "FIRE não achado"
+    if os.clock() - lastFire >= CFG.fireRate then
+      lastFire = os.clock()
+      pcall(function() tool:Activate() end)
+    end
+    return
+  end
+  if hold.on then
+    local x, y = fireXY(obj)
+    if (Vector2.new(x, y) - hold.pos).Magnitude > 8 then releaseFire() return end
+    if os.clock() - hold.lastMove > 0.2 then
+      hold.lastMove = os.clock()
+      if VIM then
+        pcall(function() VIM:SendTouchEvent(TOUCH_ID, 1, x, y) end)
+        pcall(function() VIM:SendMouseMoveEvent(x, y, game) end)
+      end
+    end
+    if S.ammo and hold.ammo0 then
+      if S.ammo < hold.ammo0 then hold.ammo0 = S.ammo; hold.t0 = os.clock() end
+      if os.clock() - hold.t0 > 2 then
+        releaseFire()
+        hold.altInset = not hold.altInset
+        hold.cool = os.clock() + 0.15
+        return
+      end
+    end
+    S.fireNote = "FIRE segurando"
+  else
+    if os.clock() < hold.cool then return end
+    pressFireHold(obj)
+    S.fireNote = "FIRE segurando"
+  end
+end))
+
+-- loop principal
+local function engage(info, id)
+  local lastTp = 0
+  local lastHp, lastHpT = info.hum.Health, os.clock()
+  S.target = info
+  S.aimPart = partOf(info.model)
+  while S.run == id do
+    if S.paused then
+      setState("PAUSADO")
+      releaseRoot()
+      lastHpT = os.clock()
+      task.wait(0.25)
+    else
+      setState("EXECUTANDO")
+      local _, root = getChar()
+      if not root then return "char" end
+      if info.dead or info.hum.Health <= 0 then return "kill" end
+      if not info.model.Parent then return "gone" end
+      local part = partOf(info.model)
+      if not part then return "gone" end
+      S.aimPart = part
+      S.dist = (part.Position - root.Position).Magnitude
+      if os.clock() - lastTp > 1.2 then
+        local hp = hoverCF and hoverCF.Position
+        local far = (not hp) or Vector2.new(hp.X - part.Position.X, hp.Z - part.Position.Z).Magnitude > 25
+        if far then
+          teleportNear(root, info.model, part)
+          lastTp = os.clock()
+        end
+      end
+      if info.hum.Health < lastHp - 0.01 then lastHp = info.hum.Health; lastHpT = os.clock() end
+      if os.clock() - lastHpT > CFG.watchdog then return "stuck" end
+      task.wait(CFG.intervalo)
+    end
+  end
+  return "stop"
+end
+
+local function stopAuto(newState)
+  S.run = S.run + 1
+  S.paused = false
+  releaseRoot()
+  S.aimPart = nil; S.target = nil; S.dist = nil
+  setState(newState or "AGUARDANDO")
+end
+
+local function mainLoop(id)
+  setState("EXECUTANDO")
+  local lastIdleScan = 0
+  while S.run == id do
+    if S.paused then
+      setState("PAUSADO")
+      releaseRoot()
+      task.wait(0.25)
+    else
+      local _, root = getChar()
+      if not root then
+        S.note = "aguardando personagem"
+        task.wait(1)
+      else
+        scanMission(false)
+        local pend, known = pendingList()
+        if known and #pend == 0 then
+          S.note = "missão concluída"
+          stopAuto("AGUARDANDO")
+          return
+        end
+        local info = pickTarget()
+        if not info then
+          S.note = "sem alvos elegíveis"
+          releaseRoot()
+          S.aimPart = nil; S.target = nil; S.dist = nil
+          if os.clock() - lastIdleScan > 3 then refreshZombies(); lastIdleScan = os.clock() end
+          task.wait(0.5)
+        else
+          S.note = "atacando " .. LABEL[info.cat]
+          local before = HUD.prog[info.cat] and HUD.prog[info.cat].cur
+          local res = engage(info, id)
+          if res == "kill" then
+            S.kills[info.cat] = (S.kills[info.cat] or 0) + 1
+            -- espera o hud confirmar a morte antes de pegar outro alvo
+            local t0 = os.clock()
+            repeat
+              task.wait(0.2)
+              scanMission(false)
+              local after = HUD.prog[info.cat] and HUD.prog[info.cat].cur
+              local confirmed = (not before) or (after and after > before)
+            until confirmed or os.clock() - t0 > 1.5 or S.run ~= id
+          elseif res == "stuck" then
+            BL[info.model] = os.clock() + 30
+          end
+          S.target = nil; S.aimPart = nil
+        end
+      end
+    end
+  end
+end
+
+local function startAuto()
+  S.run = S.run + 1
+  S.paused = false
+  local id = S.run
+  task.spawn(function()
+    local ok, e = pcall(mainLoop, id)
+    if not ok and S.run == id then
+      S.run = S.run + 1
+      setState("ERRO")
+      releaseRoot()
+      S.note = "erro: " .. tostring(e)
+    end
+  end)
+end
+
+-- scan automático dos alvos e da missão (a cada 10s)
+task.spawn(function()
+  pcall(function() refreshZombies(); scanMission(true) end)
+  local t = os.clock()
+  while uiAlive do
+    if os.clock() - t >= 10 then
+      t = os.clock()
+      pcall(function() refreshZombies(); scanMission(true) end)
+    else
+      pcall(scanMission, false)
+    end
+    task.wait(0.5)
+  end
+end)
+
+-- interface
+local Window = Rayfield:CreateWindow({
+  Name = "Auto missão drip menu",
+  LoadingTitle = "Auto missão drip menu",
+  LoadingSubtitle = "by: angel",
+  ConfigurationSaving = {Enabled = false},
+  Discord = {Enabled = false},
+  KeySystem = false,
+})
+
+local tabMain = Window:CreateTab("Principal", 4483362458)
+local tabMis = Window:CreateTab("Missão", 4483362458)
+local tabCfg = Window:CreateTab("Ajustes", 4483362458)
+
+local ui, cache = {}, {}
+local function setLbl(key, text)
+  if cache[key] == text then return end
+  cache[key] = text
+  local l = ui[key]
+  if l then pcall(function() l:Set(text) end) end
+end
+
+tabMain:CreateSection("Status")
+ui.state = tabMain:CreateLabel("Estado • AGUARDANDO")
+ui.note = tabMain:CreateLabel("pronto")
+ui.mission = tabMain:CreateLabel("Missão • não detectada")
+ui.total = tabMain:CreateLabel("Progresso total • 0%")
+ui.target = tabMain:CreateLabel("Alvo • nenhum")
+ui.weapon = tabMain:CreateLabel("Arma • sem arma")
+
+tabMain:CreateSection("Controle")
+tabMain:CreateButton({Name = "INICIAR", Callback = function()
+  if S.state == "EXECUTANDO" or S.state == "PAUSADO" then return end
+  startAuto()
+end})
+tabMain:CreateButton({Name = "PAUSAR", Callback = function()
+  if S.run == 0 or S.state == "AGUARDANDO" or S.state == "ERRO" then return end
+  S.paused = true
+  setState("PAUSADO")
+end})
+tabMain:CreateButton({Name = "RETOMAR", Callback = function()
+  if S.run == 0 or not S.paused then return end
+  S.paused = false
+  setState("EXECUTANDO")
+end})
+
+tabMis:CreateSection("Progresso")
+for _, cat in ipairs(ORDER) do
+  ui["cat_" .. cat] = tabMis:CreateLabel(LABEL[cat] .. "  —")
+end
+
+tabCfg:CreateSection("Combate")
+tabCfg:CreateToggle({Name = "Silent aim", CurrentValue = CFG.silent, Callback = function(v) CFG.silent = v end})
+tabCfg:CreateToggle({Name = "Noclip", CurrentValue = CFG.noclip, Callback = function(v) CFG.noclip = v end})
+tabCfg:CreateToggle({Name = "Deitado", CurrentValue = CFG.deitado, Callback = function(v) CFG.deitado = v end})
+tabCfg:CreateInput({
+  Name = "Nome da arma",
+  PlaceholderText = CFG.arma,
+  RemoveTextAfterFocusLost = false,
+  Callback = function(t)
+    if t and t ~= "" then CFG.arma = t end
+  end,
+})
+
+tabCfg:CreateSection("Posição")
+tabCfg:CreateSlider({
+  Name = "Altura", Range = {20, 200}, Increment = 5, Suffix = "m",
+  CurrentValue = CFG.flyAlt, Callback = function(v) CFG.flyAlt = v end,
+})
+tabCfg:CreateSlider({
+  Name = "Distância do alvo", Range = {2, 15}, Increment = 1, Suffix = "m",
+  CurrentValue = CFG.tpDist, Callback = function(v) CFG.tpDist = v end,
+})
+tabCfg:CreateSlider({
+  Name = "Intervalo do tiro", Range = {0.05, 0.5}, Increment = 0.05, Suffix = "s",
+  CurrentValue = CFG.fireRate, Callback = function(v) CFG.fireRate = v end,
+})
+
+setStateHook = function()
+  setLbl("state", "Estado • " .. S.state)
+end
+
+local function refreshPanel()
+  setLbl("note", S.note ~= "" and S.note or "pronto")
+  setLbl("mission", "Missão • " .. (HUD.mission or "não detectada"))
+
+  local tc, tm = 0, 0
+  for _, c in ipairs(ORDER) do
+    local g = HUD.prog[c]
+    if g then
+      tc = tc + g.cur; tm = tm + g.max
+      local rem = math.max(0, g.max - g.cur)
+      setLbl("cat_" .. c, string.format("%s  %d/%d  •  %s", LABEL[c], g.cur, g.max,
+        rem > 0 and ("faltam " .. rem .. ", vivos " .. aliveCount(c)) or "concluído"))
+    else
+      setLbl("cat_" .. c, LABEL[c] .. "  —")
+    end
+  end
+  local tr = tm > 0 and tc / tm or 0
+  setLbl("total", "Progresso total • " .. math.floor(tr * 100 + 0.5) .. "%")
+
+  local t = S.target
+  if t and t.model and t.hum and t.hum.Parent then
+    setLbl("target", string.format("Alvo • %s  HP %d/%d  %s", NOME1[t.cat] or "Zumbi",
+      math.floor(math.max(t.hum.Health, 0)), math.floor(math.max(t.hum.MaxHealth, 1)),
+      S.dist and (math.floor(S.dist) .. "m") or ""))
+  else
+    setLbl("target", "Alvo • nenhum")
+  end
+
+  setLbl("weapon", "Arma • " .. (S.weapon or "sem arma") .. (S.ammo and ("  " .. S.ammo) or "")
+    .. (S.fireNote ~= "" and ("  •  " .. S.fireNote) or ""))
+end
+
+task.spawn(function()
+  while uiAlive do
+    pcall(refreshPanel)
+    task.wait(0.4)
+  end
+end)
+
+bind(LP.CharacterAdded:Connect(function()
+  S.target = nil; S.aimPart = nil
+  hoverCF = nil
+  HUD.ammoLbl = nil
+end))
+
+env.amd_destroy = function()
+  pcall(releaseFire)
+  SA.dead = true
+  uiAlive = false
+  S.run = S.run + 1
+  releaseRoot()
+  S.aimPart = nil
+  for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+  for _, info in pairs(Z) do pcall(function() info.conn:Disconnect() end) end
+  pcall(function() Rayfield:Destroy() end)
+  env.amd_destroy = nil
+end
+
+setState("AGUARDANDO")
+pcall(function()
+  Rayfield:Notify({Title = "Auto missão drip menu", Content = "by: angel", Duration = 4})
+end)
